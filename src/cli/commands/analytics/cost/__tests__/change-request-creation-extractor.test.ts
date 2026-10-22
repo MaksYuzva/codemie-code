@@ -121,4 +121,27 @@ describe('change request creation evidence', () => {
     expect(extract(session([...pair(), ...pair('Bash', { command: 'gh pr create' }, 'error', 'bad')]))).toEqual({ status: 'partial', events: [gh] });
     expect(extract(session(pair('Bash', { command: 'gh pr create' }, gh.url, 'x'.repeat(257)))).events).toEqual([]);
   });
+  it.each([
+    ['gh pr create --title "--help" --body "--repo"', gh.url],
+    ['glab mr create --title "--web" --description "--hostname"', 'https://gitlab.com/team/repo/-/merge_requests/36'],
+  ])('preserves literal flag-looking CLI option values: %s', (command, url) => {
+    expect(extract(session(pair('Bash', { command }, url))).events).toHaveLength(1);
+  });
+  it.each([
+    ['gh pr create', 'https://github.com/acme/error-handler/pull/36'],
+    ['glab mr create', 'https://gitlab.com/preview/repo/-/merge_requests/36'],
+  ])('accepts success URLs containing failure vocabulary: %s', (command, url) => {
+    expect(extract(session(pair('Bash', { command }, url))).events).toHaveLength(1);
+  });
+  it.each(['host', 'hostname'])('rejects conflicting %s in secondary MCP representations', (field) => {
+    const payload = { html_url: gh.url, number: 36 };
+    const rows = pair('mcp__github__create_pull_request', {}, { structuredContent: payload,
+      content: [{ type: 'text', text: JSON.stringify({ ...payload, [field]: 'evil.example' }) }] });
+    expect(extract(session(rows))).toEqual({ status: 'partial', events: [] });
+  });
+  it('marks missing creation call IDs partial and keeps other valid events', () => {
+    const malformed = { timestamp: start, message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: 'gh pr create' } }] } };
+    expect(extract(session([malformed, ...pair()]))).toEqual({ status: 'partial', events: [gh] });
+  });
+
 });

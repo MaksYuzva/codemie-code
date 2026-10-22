@@ -32,6 +32,25 @@ function literalWords(command: string): string[] | undefined {
   return words;
 }
 
+/** Consume value options before inspecting flags, since quoted values may themselves look like flags. */
+function cliOptions(args: string[], provider: Provider): string[] | undefined {
+  const values = new Set(provider === 'github'
+    ? ['--title', '-t', '--body', '-b', '--body-file', '-F', '--base', '-B', '--head', '-H', '--reviewer', '-r', '--assignee', '-a', '--label', '-l', '--milestone', '-m', '--project', '-p', '--template', '-T']
+    : ['--title', '-t', '--description', '-d', '--target-branch', '-b', '--source-branch', '-s', '--reviewer', '--assignee', '-a', '--label', '-l', '--milestone', '-m']);
+  const options: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i], flag = arg.split('=')[0];
+    if (values.has(flag)) { if (!arg.includes('=') && args[++i] === undefined) return; continue; }
+    if (/^(?:--(?:help|web|dry-run|recover)|-h|-w)(?:=|$)/.test(arg)) return;
+    options.push(arg);
+    if (['--repo', '-R', '--host', '--hostname'].includes(arg)) {
+      if (args[i + 1] === undefined) return;
+      options.push(args[++i]);
+    }
+  }
+  return options;
+}
+
 function invocation(block: ClaudeNativeBlock): Invocation | null | undefined {
   const input = object(block.input) ?? {};
   if (block.name === 'mcp__github__create_pull_request') return { provider: 'github', source: 'github_mcp', input };
@@ -40,9 +59,10 @@ function invocation(block: ClaudeNativeBlock): Invocation | null | undefined {
   if (!/^\s*(?:gh\s+pr|glab\s+mr)\s+create\b/.test(input.command)) return;
   const words = literalWords(input.command);
   if (!words || words[2] !== 'create') return null;
-  // These modes do not provide a successful direct-create result contract.
-  if (words.slice(3).some((arg) => /^(?:--(?:help|web|dry-run|recover)|-h|-w)(?:=|$)/.test(arg))) return null;
-  return { provider: words[0] === 'gh' ? 'github' : 'gitlab', source: words[0] === 'gh' ? 'gh_cli' : 'glab_cli', input, args: words.slice(3) };
+  const provider = words[0] === 'gh' ? 'github' : 'gitlab';
+  const args = cliOptions(words.slice(3), provider);
+  if (!args) return null;
+  return { provider, source: provider === 'github' ? 'gh_cli' : 'glab_cli', input, args };
 }
 
 function parseUrl(value: unknown, provider: Provider): Pick<ChangeRequestCreationEvent, 'host' | 'repository' | 'number' | 'url'> | undefined {
@@ -107,81 +127,117 @@ function responseContent(value: unknown): unknown {
   return value;
 }
 
-function verifiedResult(call: Invocation, occurrence: Occurrence): ReturnType<typeof parseUrl> {
-  const block = occurrence.block as ClaudeNativeBlock & { content?: unknown; structuredContent?: unknown };
-  if (failed(block) || failed(occurrence.row.toolUseResult)) return;
-  if (call.args) {
-    const content = typeof block.content === 'string' ? block.content : undefined;
-    if (!content || /\b(?:error|failed|failure|already|exists|preview)\b/i.test(content)) return;
-    const lines = content.trim().split(/\r?\n/).map((line) => line.trim());
-    const urls = lines.filter((line) => /^https:\/\/\S+$/.test(line));
-    if (urls.length !== 1) return;
-    const result = parseUrl(urls[0], call.provider);
-    return result && cliMatches(call, result) ? result : undefined;
+function cliResult(call: Invocation, content: unknown): ReturnType<typeof parseUrl> {
+  if (typeof content !== 'string' || !content) return;
+  const lines = content.trim().split(/\r?\n/).map((line) => line.trim());
+  const urls = lines.filter((line) => /^https:\/\/\S+$/.test(line));
+  const prose = lines.filter((line) => !/^https:\/\/\S+$/.test(line)).join('\n');
+  if (urls.length !== 1 || /\b(?:error|failed|failure|already|exists|preview)\b/i.test(prose)) return;
+  const result = parseUrl(urls[0], call.provider);
+  return result && cliMatches(call, result) ? result : undefined;
+}
+
+function collectRepresentations(value: unknown, records: RecordValue[]): boolean {
+  const record = object(responseContent(value));
+  if (!record || failed(record)) return false;
+  records.push(record);
+  for (const field of ['structuredContent', 'content']) {
+    if (record[field] !== undefined && !collectRepresentations(record[field], records)) return false;
   }
+  return true;
+}
+
+function mcpTargetMatches(call: Invocation, payload: RecordValue, result: NonNullable<ReturnType<typeof parseUrl>>): boolean {
+  if (call.provider === 'github') {
+    return payload.number === result.number
+      && (call.input.owner === undefined || call.input.owner === result.repository.split('/')[0])
+      && (call.input.repo === undefined || call.input.repo === result.repository.split('/')[1]);
+  }
+  if (payload.iid !== result.number || !positive(payload.project_id)) return false;
+  const project = call.input.project_id;
+  if (typeof project === 'number' || typeof project === 'string' && /^\d+$/.test(project)) {
+    return positive(Number(project)) && Number(project) === payload.project_id;
+  }
+  if (typeof project !== 'string') return false;
+  try { return targetMatches(decodeURIComponent(project), result, 'gitlab'); } catch { return false; }
+}
+
+function mcpResult(call: Invocation, block: ClaudeNativeBlock & { content?: unknown; structuredContent?: unknown }): ReturnType<typeof parseUrl> {
   const raw = responseContent(block.structuredContent ?? block.content);
-  // If integrations emit more than one representation, every supplied identity must agree.
+  // Validate every envelope and alternative representation, not just the chosen payload.
   const representations: RecordValue[] = [];
-  const collect = (value: unknown): boolean => {
-    const record = object(responseContent(value));
-    if (!record || failed(record)) return false;
-    if (record.html_url !== undefined || record.web_url !== undefined) representations.push(record);
-    for (const field of ['structuredContent', 'content']) {
-      if (record[field] !== undefined && !collect(record[field])) return false;
-    }
-    return true;
-  };
-  if (!collect(raw)) return;
-  if (block.structuredContent !== undefined && block.content !== undefined && !collect(block.content)) return;
+  if (!collectRepresentations(raw, representations)) return;
+  if (block.structuredContent !== undefined && block.content !== undefined && !collectRepresentations(block.content, representations)) return;
   const envelope = object(raw);
-  if (!envelope || failed(envelope)) return;
+  if (!envelope) return;
   const payload = object(envelope.structuredContent) ?? (envelope.content !== undefined ? object(responseContent(envelope.content)) : envelope);
-  if (!payload || failed(payload)) return;
+  if (!payload) return;
   const result = parseUrl(call.provider === 'github' ? payload.html_url : payload.web_url, call.provider);
   if (!result) return;
+  for (const representation of [call.input, block, ...representations]) {
+    if (['host', 'hostname'].some((field) => representation[field] !== undefined && representation[field] !== result.host)) return;
+  }
   for (const representation of representations) {
+    if (representation.html_url === undefined && representation.web_url === undefined) continue;
     const identityUrl = parseUrl(call.provider === 'github' ? representation.html_url : representation.web_url, call.provider);
     if (!identityUrl || identityUrl.url !== result.url
       || (call.provider === 'github' ? representation.number !== result.number : representation.iid !== result.number || representation.project_id !== payload.project_id)) return;
   }
-  for (const field of ['host', 'hostname']) {
-    if (call.input[field] !== undefined && call.input[field] !== result.host) return;
-    if (payload[field] !== undefined && payload[field] !== result.host) return;
-    if (envelope[field] !== undefined && envelope[field] !== result.host) return;
-  }
-  if (call.provider === 'github') {
-    if (payload.number !== result.number) return;
-    if (call.input.owner !== undefined && call.input.owner !== result.repository.split('/')[0]) return;
-    if (call.input.repo !== undefined && call.input.repo !== result.repository.split('/')[1]) return;
-  } else {
-    if (payload.iid !== result.number || !positive(payload.project_id)) return;
-    const project = call.input.project_id;
-    if (typeof project === 'number' || typeof project === 'string' && /^\d+$/.test(project)) {
-      if (!positive(Number(project)) || Number(project) !== payload.project_id) return;
-    } else if (typeof project === 'string') {
-      try { if (!targetMatches(decodeURIComponent(project), result, 'gitlab')) return; } catch { return; }
-    } else return;
-  }
-  return result;
+  return mcpTargetMatches(call, payload, result) ? result : undefined;
 }
 
-/** Inspect owned native tool pairs without interpreting arbitrary shell or exporting raw content. */
-export function extractChangeRequestCreationEvidence(parsed: ParsedSession, window: { start?: number; end?: number } = {}): ChangeRequestCreationEvidence {
-  const index = buildClaudeTraceIndex(parsed);
-  const calls = new Map<string, Occurrence[]>(), results = new Map<string, Occurrence[]>();
-  const evidence: ChangeRequestCreationEvidence = { status: 'available', events: [] };
+function verifiedResult(call: Invocation, occurrence: Occurrence): ReturnType<typeof parseUrl> {
+  const block = occurrence.block as ClaudeNativeBlock & { content?: unknown; structuredContent?: unknown };
+  if (failed(block) || failed(occurrence.row.toolUseResult)) return;
+  return call.args ? cliResult(call, block.content) : mcpResult(call, block);
+}
+
+type TraceIndex = ReturnType<typeof buildClaudeTraceIndex>;
+type Occurrences = Map<string, Occurrence[]>;
+interface EvidenceWindow { start?: number; end?: number; observedEnd?: number }
+
+function collectOccurrences(index: TraceIndex, evidence: ChangeRequestCreationEvidence): { calls: Occurrences; results: Occurrences } {
+  const calls: Occurrences = new Map(), results: Occurrences = new Map();
   for (const owner of index.owners.values()) {
     for (const row of owner.messages as ClaudeNativeRow[]) {
       for (const block of claudeBlocks(row ?? {})) {
         const id = block.type === 'tool_use' ? block.id : block.type === 'tool_result' ? block.tool_use_id : undefined;
-        if (!id) continue;
+        if (!id) {
+          if (block.type === 'tool_use' && invocation(block) !== undefined) evidence.status = 'partial';
+          continue;
+        }
         const map = block.type === 'tool_use' ? calls : results;
         const values = map.get(id) ?? [];
         values.push({ row, block, owner: owner.id }); map.set(id, values);
       }
     }
   }
-  const inWindow = (time: number): boolean => (window.start === undefined || time >= window.start) && (window.end === undefined || time < window.end);
+  return { calls, results };
+}
+
+function linkedOwner(owner: string | undefined, index: TraceIndex, calls: Occurrences, inWindow: (time: number) => boolean): boolean {
+  let ancestor = owner;
+  const visited = new Set<string>();
+  while (ancestor && ancestor !== index.rootOwnerId && !visited.has(ancestor)) {
+    visited.add(ancestor);
+    const agent = index.agents.get(ancestor);
+    const launches = agent?.toolUseId ? calls.get(agent.toolUseId)?.filter((entry) => entry.owner === agent.ownerAgentId) : undefined;
+    if (!launches?.length || launches.some((launch) => {
+      const time = claudeTimestamp(launch.row);
+      return time === undefined || !inWindow(time);
+    })) return false;
+    ancestor = agent?.relationshipStatus === 'resolved' ? agent.ownerAgentId : undefined;
+  }
+  return ancestor === index.rootOwnerId;
+}
+
+/** Inspect owned native tool pairs without interpreting arbitrary shell or exporting raw content. */
+export function extractChangeRequestCreationEvidence(parsed: ParsedSession, window: EvidenceWindow = {}): ChangeRequestCreationEvidence {
+  const index = buildClaudeTraceIndex(parsed);
+  const evidence: ChangeRequestCreationEvidence = { status: 'available', events: [] };
+  const { calls, results } = collectOccurrences(index, evidence);
+  const inWindow = (time: number): boolean => (window.start === undefined || time >= window.start)
+    && (window.end === undefined || time < window.end) && (window.observedEnd === undefined || time <= window.observedEnd);
   for (const [id, occurrences] of calls) {
     if (!occurrences.some((entry) => invocation(entry.block) !== undefined)) continue;
     const owner = index.toolOwners.get(id);
@@ -194,21 +250,7 @@ export function extractChangeRequestCreationEvidence(parsed: ParsedSession, wind
     // A replay outside the receiving session's bounds is not a candidate for that session.
     if (begin !== undefined && !inWindow(begin) || end !== undefined && !inWindow(end)) continue;
     const call = first && invocation(first.block);
-    let linked = owner === index.rootOwnerId;
-    let ancestor = owner;
-    const visited = new Set<string>();
-    while (ancestor && !linked && !visited.has(ancestor)) {
-      visited.add(ancestor);
-      const agent = index.agents.get(ancestor);
-      const launches = agent?.toolUseId ? calls.get(agent.toolUseId)?.filter((entry) => entry.owner === agent.ownerAgentId) : undefined;
-      if (!launches?.length || launches.some((launch) => {
-        const time = claudeTimestamp(launch.row);
-        return time === undefined || !inWindow(time);
-      })) break;
-      ancestor = agent?.relationshipStatus === 'resolved' ? agent.ownerAgentId : undefined;
-      linked = ancestor === index.rootOwnerId;
-    }
-    if (!call || !identity(id) || !owner || !identity(owner) || !linked || index.conflictingTools.has(id)
+    if (!call || !identity(id) || !owner || !identity(owner) || !linkedOwner(owner, index, calls, inWindow) || index.conflictingTools.has(id)
       || uniqueCalls.size !== 1 || uniqueResults.size !== 1 || begin === undefined || end === undefined || end < begin) {
       evidence.status = 'partial'; continue;
     }

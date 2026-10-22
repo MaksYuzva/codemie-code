@@ -626,10 +626,10 @@ export async function enrichCosts(
       cost.changeRequestCreation = { status: entry.hadLog ? 'partial' : 'unavailable', events: [] };
       if (entry.parsed) {
         try {
-          const ends = [entry.observedEnd, nextSiblingStart.get(entry.sessionId)].filter((value): value is number => value !== undefined);
           const evidence = extractChangeRequestCreationEvidence(entry.parsed, {
             start: entry.observedStart ?? (entry.startTime > 0 ? entry.startTime : undefined),
-            end: ends.length ? Math.min(...ends) : undefined,
+            end: nextSiblingStart.get(entry.sessionId),
+            observedEnd: entry.observedEnd,
           });
           evidence.events = evidence.events.filter((event) => {
             const key = JSON.stringify([event.toolUseId, event.owner === 'root' ? 'root' : event.ownerId,

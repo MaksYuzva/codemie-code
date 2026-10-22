@@ -1243,4 +1243,31 @@ describe('change request creation enrichment', () => {
     expect(index.get('bad')?.changeRequestCreation).toEqual({ status: 'partial', events: [] });
     expect(index.get('good')?.changeRequestCreation?.events).toHaveLength(1);
   });
+  it('includes a creation result exactly at the observed session end', async () => {
+    const sessions = [{ sessionId: 'early', startEvent: { agentName: 'claude', data: { startTime: begin } },
+      endEvent: { data: { endTime: begin + 1000 } }, deltas: [] }] as never[];
+    const { index } = await enrichCosts(sessions, { ...baseDeps, parseNative: async () => parsed as never });
+    expect(index.get('early')?.changeRequestCreation?.events).toHaveLength(1);
+  });
+  it('excludes a result exactly at the next shared-file session start', async () => {
+    const sessions = [
+      { sessionId: 'early', startEvent: { agentName: 'claude', data: { startTime: begin } }, endEvent: { data: { endTime: begin + 1000 } }, deltas: [] },
+      { sessionId: 'later', startEvent: { agentName: 'claude', data: { startTime: begin + 1000 } }, deltas: [] },
+    ] as never[];
+    const { index } = await enrichCosts(sessions, { ...baseDeps, parseNative: async () => parsed as never });
+    expect(index.get('early')?.changeRequestCreation?.events).toEqual([]);
+    expect(index.get('later')?.changeRequestCreation?.events).toEqual([]);
+  });
+  it('deduplicates cross-file replay with overlapping session windows to the earliest session', async () => {
+    const sessions = [
+      { sessionId: 'later', startEvent: { agentName: 'claude', data: { startTime: begin } }, endEvent: { data: { endTime: begin + 2000 } }, deltas: [] },
+      { sessionId: 'early', startEvent: { agentName: 'claude', data: { startTime: begin - 1000 } }, endEvent: { data: { endTime: begin + 2000 } }, deltas: [] },
+    ] as never[];
+    const { index } = await enrichCosts(sessions, { ...baseDeps,
+      loadAgentSessionFile: async (item) => `/fake/${item.sessionId}.jsonl`, parseNative: async () => parsed as never });
+    expect(index.get('early')?.changeRequestCreation?.events).toHaveLength(1);
+    expect(index.get('later')?.changeRequestCreation?.events).toEqual([]);
+    expect([...index.values()].flatMap((cost) => cost.changeRequestCreation?.events ?? [])).toHaveLength(1);
+  });
+
 });
