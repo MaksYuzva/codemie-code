@@ -1199,3 +1199,48 @@ describe('enrichCosts — routing classifier cost', () => {
     expect(c.costUSD).toBeCloseTo(3, 6);
   });
 });
+
+
+describe('change request creation enrichment', () => {
+  const begin = Date.parse('2026-10-22T10:00:00.000Z');
+  const messages = [
+    { timestamp: new Date(begin).toISOString(), message: { id: 'response-create', content: [{ type: 'tool_use', id: 'create-1', name: 'Bash', input: { command: 'glab mr create' } }] } },
+    { timestamp: new Date(begin + 1000).toISOString(), message: { content: [{ type: 'tool_result', tool_use_id: 'create-1', content: 'https://gitlab.com/team/repo/-/merge_requests/4' }] } },
+  ];
+  const parsed = { sessionId: 'native', agentName: 'claude', metadata: {}, messages };
+  it('retains creation independently of usage/pricing and excludes cross-session replay', async () => {
+    const sessions = [
+      { sessionId: 'early', startEvent: { agentName: 'claude', data: { startTime: begin } }, deltas: [] },
+      { sessionId: 'later', startEvent: { agentName: 'claude', data: { startTime: begin + 2000 } }, deltas: [] },
+    ] as never[];
+    const { index } = await enrichCosts(sessions, { ...baseDeps, parseNative: async () => parsed as never });
+    expect(index.get('early')).toMatchObject({ priced: false, costUSD: 0, changeRequestCreation: { status: 'available', events: [{ number: 4, provider: 'gitlab' }] } });
+    expect(index.get('later')?.changeRequestCreation?.events).toEqual([]);
+  });
+  it('does not assign later shared-file creations to an earlier open session', async () => {
+    const sessions = [
+      { sessionId: 'early', startEvent: { agentName: 'claude', data: { startTime: begin - 2000 } }, deltas: [] },
+      { sessionId: 'later', startEvent: { agentName: 'claude', data: { startTime: begin } }, deltas: [] },
+    ] as never[];
+    const { index } = await enrichCosts(sessions, { ...baseDeps, parseNative: async () => parsed as never });
+    expect(index.get('early')?.changeRequestCreation?.events).toEqual([]);
+    expect(index.get('later')?.changeRequestCreation?.events).toHaveLength(1);
+  });
+  it('marks missing, unreadable and unsupported logs distinctly', async () => {
+    const missing = await enrichCosts(raw, { ...baseDeps, loadAgentSessionFile: async () => null });
+    expect(missing.index.get('s1')?.changeRequestCreation).toEqual({ status: 'unavailable', events: [] });
+    const broken = await enrichCosts(raw, { ...baseDeps, parseNative: async () => null });
+    expect(broken.index.get('s1')?.changeRequestCreation).toEqual({ status: 'partial', events: [] });
+    const unsupported = await enrichCosts(raw, { ...baseDeps, resolveAgentName: () => 'codex' });
+    expect(unsupported.index.get('s1')?.changeRequestCreation).toEqual({ status: 'unsupported', events: [] });
+  });
+  it('isolates malformed extraction from neighboring sessions', async () => {
+    const sessions = ['bad', 'good'].map((sessionId) => ({ sessionId, startEvent: { agentName: 'claude' }, deltas: [] })) as never[];
+    const { index } = await enrichCosts(sessions, { ...baseDeps,
+      loadAgentSessionFile: async (item) => `/fake/${item.sessionId}`,
+      parseNative: async (_agent, _file, id) => ({ ...parsed, subagents: id === 'bad' ? [null] : [] }) as never,
+    });
+    expect(index.get('bad')?.changeRequestCreation).toEqual({ status: 'partial', events: [] });
+    expect(index.get('good')?.changeRequestCreation?.events).toHaveLength(1);
+  });
+});

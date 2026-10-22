@@ -1,3 +1,4 @@
+import { extractChangeRequestCreationEvidence } from './change-request-creation-extractor.js';
 /**
  * Report-time cost enrichment.
  *
@@ -558,6 +559,7 @@ export async function enrichCosts(
   // turns into resumed/forked logs, so the same response appears in many files. Then price.
   const ordered = [...parsedEntries].sort((a, b) => a.startTime - b.startTime);
   const seen = new Set<string>();
+  const seenCreations = new Set<string>();
   const sharedFileGroups = groupSharedFileSiblings(ordered);
   const reportedObservedEnd = computeReportedObservedEnd(sharedFileGroups);
   const nextSiblingStart = computeNextSiblingStart(sharedFileGroups);
@@ -618,6 +620,31 @@ export async function enrichCosts(
       records = [];
     }
     const { cost, unpriced: u, estimated: est, local: loc } = priceUsage(entry.sessionId, entry.hadLog, usageByModel, entry.provider);
+    // Creation evidence is independent of usage/pricing and never uses cosmetic end estimates.
+    cost.changeRequestCreation = { status: 'unsupported', events: [] };
+    if (['claude', 'claude-acp', 'claude-desktop'].includes(entry.agentName.toLowerCase())) {
+      cost.changeRequestCreation = { status: entry.hadLog ? 'partial' : 'unavailable', events: [] };
+      if (entry.parsed) {
+        try {
+          const ends = [entry.observedEnd, nextSiblingStart.get(entry.sessionId)].filter((value): value is number => value !== undefined);
+          const evidence = extractChangeRequestCreationEvidence(entry.parsed, {
+            start: entry.observedStart ?? (entry.startTime > 0 ? entry.startTime : undefined),
+            end: ends.length ? Math.min(...ends) : undefined,
+          });
+          evidence.events = evidence.events.filter((event) => {
+            const key = JSON.stringify([event.toolUseId, event.owner === 'root' ? 'root' : event.ownerId,
+              event.provider, event.host, event.repository, event.number]);
+            if (seenCreations.has(key)) return false;
+            seenCreations.add(key);
+            return true;
+          });
+          cost.changeRequestCreation = evidence;
+        } catch {
+          // Coverage communicates failure without leaking native commands/results to diagnostics.
+          cost.changeRequestCreation = { status: 'partial', events: [] };
+        }
+      }
+    }
     if (entry.capturedAt !== undefined) cost.capturedAt = entry.capturedAt;
     if (entry.observedStart !== undefined) cost.observedStart = entry.observedStart;
     if (entry.observedEnd !== undefined) cost.observedEnd = entry.observedEnd;
