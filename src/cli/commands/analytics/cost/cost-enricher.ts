@@ -258,20 +258,12 @@ function resolveCreationEvidence(entry: ParsedEntry, siblingStart: number | unde
   if (!['claude', 'claude-acp', 'claude-desktop'].includes(entry.agentName.toLowerCase())) return { status: 'unsupported', events: [] };
   if (!entry.parsed) return { status: entry.hadLog ? 'partial' : 'unavailable', events: [] };
   try {
-    const evidence = extractChangeRequestCreationEvidence(entry.parsed, {
+    return extractChangeRequestCreationEvidence(entry.parsed, {
       start: entry.observedStart ?? (entry.startTime > 0 ? entry.startTime : undefined),
       end: siblingStart,
       // Correct the Stop-hook write race using owned usage, never a cosmetic end estimate.
       observedEnd: floorObservedEnd(entry, siblingStart),
-    });
-    evidence.events = evidence.events.filter((event) => {
-      const key = JSON.stringify([event.toolUseId, event.owner === 'root' ? 'root' : event.ownerId,
-        event.provider, event.host, event.repository, event.number]);
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
-    return evidence;
+    }, seen);
   } catch {
     // Coverage communicates failure without leaking native commands/results to diagnostics.
     return { status: 'partial', events: [] };

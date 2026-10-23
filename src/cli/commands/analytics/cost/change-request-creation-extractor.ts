@@ -6,25 +6,35 @@ import type { ChangeRequestCreationEvent, ChangeRequestCreationEvidence } from '
 type RecordValue = Record<string, unknown>;
 type Provider = ChangeRequestCreationEvent['provider'];
 interface Invocation { provider: Provider; source: ChangeRequestCreationEvent['source']; input: RecordValue; args?: string[] }
-interface Occurrence { row: ClaudeNativeRow; block: ClaudeNativeBlock; owner: string }
+interface Occurrence { row: ClaudeNativeRow; block: ClaudeNativeBlock; owner: string; blockIndex: number }
 const MAX_EVENTS = 100;
+const MAX_ENVELOPE_DEPTH = 32;
+const MAX_REPRESENTATIONS = 128;
 const identity = (value: unknown): value is string => typeof value === 'string' && value.length > 0 && value.length <= 256 && ![...value].some((char) => /\s/.test(char) || char.charCodeAt(0) < 32 || char.charCodeAt(0) === 127);
 const object = (value: unknown): RecordValue | undefined => value !== null && typeof value === 'object' && !Array.isArray(value) ? value as RecordValue : undefined;
 const positive = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
 
 /** Deliberately not a shell interpreter: accept only literal words and literal quotes. */
-function literalWords(command: string): string[] | undefined {
-  if (/[\r\n]/.test(command)) return;
+function literalWords(command: string, prefixOnly = false): string[] | undefined {
+  command = command.trim();
   const words: string[] = [];
   let word = '', quote = '', active = false;
   for (const char of command) {
     if (quote) {
       if (char === quote) quote = '';
-      else if (quote === '"' && /[$`\\]/.test(char)) return;
+      else if (quote === '"' && /[$`\\]/.test(char)) return prefixOnly ? words : undefined;
       else word += char;
     } else if (char === "'" || char === '"') { quote = char; active = true; }
-    else if (/\s/.test(char)) { if (active) words.push(word); word = ''; active = false; }
-    else if (/[;&|<>$`\\(){}*?[\]~#]/.test(char)) return;
+    else if (/[\r\n]/.test(char)) {
+      // A quoted newline is literal data; trailing command whitespace was trimmed above.
+      return prefixOnly ? [...words, ...(active ? [word] : [])] : undefined;
+    }
+    else if (/\s/.test(char)) {
+      if (active) words.push(word);
+      if (prefixOnly && words.length === 3) return words;
+      word = ''; active = false;
+    }
+    else if (/[;&|<>$`\\(){}*?[\]~#]/.test(char)) return prefixOnly ? [...words, ...(active ? [word] : [])] : undefined;
     else { word += char; active = true; }
   }
   if (quote) return;
@@ -57,9 +67,10 @@ function invocation(block: ClaudeNativeBlock): Invocation | null | undefined {
   if (block.name === 'mcp__github__create_pull_request') return { provider: 'github', source: 'github_mcp', input };
   if (block.name === 'mcp__gitlab__create_merge_request') return { provider: 'gitlab', source: 'gitlab_mcp', input };
   if (block.name !== 'Bash' || typeof input.command !== 'string') return;
-  if (!/^\s*(?:gh\s+pr|glab\s+mr)\s+create\b/.test(input.command)) return;
+  const prefix = literalWords(input.command, true);
+  if (!prefix || !((prefix[0] === 'gh' && prefix[1] === 'pr') || (prefix[0] === 'glab' && prefix[1] === 'mr')) || prefix[2] !== 'create') return;
   const words = literalWords(input.command);
-  if (!words || words[2] !== 'create') return null;
+  if (!words) return null;
   const provider = words[0] === 'gh' ? 'github' : 'gitlab';
   const args = cliOptions(words.slice(3), provider);
   if (!args) return null;
@@ -118,12 +129,12 @@ function failed(value: unknown): boolean {
 }
 
 function responseContent(value: unknown): unknown {
-  if (typeof value === 'string') { try { return JSON.parse(value); } catch { return value; } }
-  if (Array.isArray(value)) {
+  for (let depth = 0; depth < MAX_ENVELOPE_DEPTH; depth++) {
+    if (typeof value === 'string') { try { return JSON.parse(value); } catch { return value; } }
+    if (!Array.isArray(value)) return value;
     if (value.length !== 1 || object(value[0])?.type !== 'text') return;
-    return responseContent(object(value[0])?.text);
+    value = object(value[0])?.text;
   }
-  return value;
 }
 
 function cliResult(call: Invocation, content: unknown): ReturnType<typeof parseUrl> {
@@ -137,12 +148,13 @@ function cliResult(call: Invocation, content: unknown): ReturnType<typeof parseU
   return result && cliMatches(call, result) ? result : undefined;
 }
 
-function collectRepresentations(value: unknown, records: RecordValue[]): boolean {
+function collectRepresentations(value: unknown, records: RecordValue[], depth = 0): boolean {
+  if (depth >= MAX_ENVELOPE_DEPTH || records.length >= MAX_REPRESENTATIONS) return false;
   const record = object(responseContent(value));
   if (!record || failed(record)) return false;
   records.push(record);
   for (const field of ['structuredContent', 'content']) {
-    if (record[field] !== undefined && !collectRepresentations(record[field], records)) return false;
+    if (record[field] !== undefined && !collectRepresentations(record[field], records, depth + 1)) return false;
   }
   return true;
 }
@@ -177,11 +189,16 @@ function mcpResult(call: Invocation, block: ClaudeNativeBlock & { content?: unkn
   for (const representation of [call.input, block, ...representations]) {
     if (['host', 'hostname'].some((field) => representation[field] !== undefined && representation[field] !== result.host)) return;
   }
-  for (const representation of representations) {
-    if (representation.html_url === undefined && representation.web_url === undefined) continue;
-    const identityUrl = parseUrl(call.provider === 'github' ? representation.html_url : representation.web_url, call.provider);
-    if (!identityUrl || identityUrl.url !== result.url
-      || (call.provider === 'github' ? representation.number !== result.number : representation.iid !== result.number || representation.project_id !== payload.project_id)) return;
+  for (const representation of [object(block)!, ...representations]) {
+    if (call.provider === 'github') {
+      if (representation.number !== undefined && representation.number !== result.number) return;
+    } else if (representation.iid !== undefined && representation.iid !== result.number
+      || representation.project_id !== undefined && representation.project_id !== payload.project_id) return;
+    if (representation.html_url !== undefined || representation.web_url !== undefined) {
+      const identityUrl = parseUrl(call.provider === 'github' ? representation.html_url : representation.web_url, call.provider);
+      if (!identityUrl || identityUrl.url !== result.url
+        || (call.provider === 'github' ? representation.number !== result.number : representation.iid !== result.number || representation.project_id !== payload.project_id)) return;
+    }
   }
   return mcpTargetMatches(call, payload, result) ? result : undefined;
 }
@@ -196,27 +213,28 @@ type TraceIndex = ReturnType<typeof buildClaudeTraceIndex>;
 type Occurrences = Map<string, Occurrence[]>;
 interface EvidenceWindow { start?: number; end?: number; observedEnd?: number }
 
-function collectRow(row: ClaudeNativeRow, owner: string, calls: Occurrences, results: Occurrences): boolean {
+function collectRow(row: ClaudeNativeRow, owner: string, calls: Occurrences, results: Occurrences, inWindow: (time: number) => boolean): boolean {
   let partial = false;
-  for (const block of claudeBlocks(row ?? {})) {
+  for (const [blockIndex, block] of claudeBlocks(row ?? {}).entries()) {
     const id = block.type === 'tool_use' ? block.id : block.type === 'tool_result' ? block.tool_use_id : undefined;
     if (!id) {
-      partial ||= block.type === 'tool_use' && invocation(block) !== undefined;
+      const time = claudeTimestamp(row);
+      partial ||= (time === undefined || inWindow(time)) && block.type === 'tool_use' && invocation(block) !== undefined;
       continue;
     }
     const map = block.type === 'tool_use' ? calls : results;
     const values = map.get(id) ?? [];
-    values.push({ row, block, owner }); map.set(id, values);
+    values.push({ row, block, owner, blockIndex }); map.set(id, values);
   }
   return partial;
 }
 
-function collectOccurrences(index: TraceIndex, evidence: ChangeRequestCreationEvidence): { calls: Occurrences; results: Occurrences } {
+function collectOccurrences(index: TraceIndex, evidence: ChangeRequestCreationEvidence, inWindow: (time: number) => boolean): { calls: Occurrences; results: Occurrences } {
   const calls: Occurrences = new Map(), results: Occurrences = new Map();
   let partial = false;
   for (const owner of index.owners.values()) {
     for (const row of owner.messages as ClaudeNativeRow[]) {
-      const rowPartial = collectRow(row, owner.id, calls, results);
+      const rowPartial = collectRow(row, owner.id, calls, results, inWindow);
       partial ||= rowPartial;
     }
   }
@@ -224,54 +242,79 @@ function collectOccurrences(index: TraceIndex, evidence: ChangeRequestCreationEv
   return { calls, results };
 }
 
-function linkedOwner(owner: string | undefined, index: TraceIndex, calls: Occurrences, inWindow: (time: number) => boolean): boolean {
+/** Only identical native messages prove a replay; content equality alone does not. */
+function uniqueOccurrences(occurrences: Occurrence[]): number {
+  return new Set(occurrences.map((entry, position) => JSON.stringify([
+    entry.row.uuid, entry.row.message?.id, entry.row.requestId,
+    entry.row.uuid || entry.row.message?.id || entry.row.requestId ? undefined : position,
+    entry.blockIndex, entry.block, entry.row.timestamp, entry.row.toolUseResult,
+  ]))).size;
+}
+
+function linkedOwner(owner: string | undefined, index: TraceIndex, calls: Occurrences, inWindow: (time: number) => boolean, creationTime: number): boolean {
   let ancestor = owner;
+  let latestLaunch = creationTime;
   const visited = new Set<string>();
   while (ancestor && ancestor !== index.rootOwnerId && !visited.has(ancestor)) {
     visited.add(ancestor);
     const agent = index.agents.get(ancestor);
     const launches = agent?.toolUseId ? calls.get(agent.toolUseId)?.filter((entry) => entry.owner === agent.ownerAgentId) : undefined;
-    if (!launches?.length || launches.some((launch) => {
+    if (!launches?.length || uniqueOccurrences(launches) !== 1 || launches.some((launch) => {
       const time = claudeTimestamp(launch.row);
-      return time === undefined || !inWindow(time);
+      return time === undefined || !inWindow(time) || time > latestLaunch;
     })) return false;
+    latestLaunch = claudeTimestamp(launches[0].row)!;
     ancestor = agent?.relationshipStatus === 'resolved' ? agent.ownerAgentId : undefined;
   }
   return ancestor === index.rootOwnerId;
 }
 
-/** Inspect owned native tool pairs without interpreting arbitrary shell or exporting raw content. */
-export function extractChangeRequestCreationEvidence(parsed: ParsedSession, window: EvidenceWindow = {}): ChangeRequestCreationEvidence {
+function creationCandidate(id: string, occurrences: Occurrence[], results: Occurrences, calls: Occurrences, index: TraceIndex,
+  inWindow: (time: number) => boolean): ChangeRequestCreationEvent | 'partial' | undefined {
+  if (!occurrences.some((entry) => invocation(entry.block) !== undefined)) return;
+  const owner = index.toolOwners.get(id);
+  const owned = occurrences.filter((entry) => entry.owner === owner);
+  const paired = (results.get(id) ?? []).filter((entry) => entry.owner === owner);
+  const first = owned[0], response = paired[0];
+  const begin = first && claudeTimestamp(first.row), end = response && claudeTimestamp(response.row);
+  // A replay outside the receiving session's bounds is not a candidate for that session.
+  if (begin !== undefined && !inWindow(begin) || end !== undefined && !inWindow(end)) {
+    return begin !== undefined && inWindow(begin) || end !== undefined && inWindow(end) ? 'partial' : undefined;
+  }
+  const call = first && invocation(first.block);
+  if (!call || !identity(id) || !owner || !identity(owner) || index.conflictingTools.has(id)
+    || uniqueOccurrences(occurrences) !== 1 || uniqueOccurrences(paired) !== 1 || begin === undefined || end === undefined || end < begin
+    || !linkedOwner(owner, index, calls, inWindow, begin)) return 'partial';
+  const result = verifiedResult(call, response);
+  if (!result) return 'partial';
+  return { type: call.provider === 'github' ? 'pr_created' : 'mr_created', provider: call.provider, ...result,
+    timestamp: new Date(end).toISOString(), source: call.source, toolUseId: id,
+    owner: owner === index.rootOwnerId ? 'root' : 'subagent', ...(owner !== index.rootOwnerId ? { ownerId: owner } : {}) };
+}
+
+/** Inspect owned native pairs; claim cross-session replays before spending the output limit. */
+export function extractChangeRequestCreationEvidence(parsed: ParsedSession, window: EvidenceWindow = {}, seen: Set<string> = new Set()): ChangeRequestCreationEvidence {
+  if (parsed.transcriptMeta?.rootUnavailable) return { status: 'unavailable', events: [] };
   const index = buildClaudeTraceIndex(parsed);
-  const evidence: ChangeRequestCreationEvidence = { status: 'available', events: [] };
-  const { calls, results } = collectOccurrences(index, evidence);
+  const evidence: ChangeRequestCreationEvidence = { status: parsed.transcriptMeta?.partial ? 'partial' : 'available', events: [] };
   const inWindow = (time: number): boolean => (window.start === undefined || time >= window.start)
     && (window.end === undefined || time < window.end) && (window.observedEnd === undefined || time <= window.observedEnd);
+  const { calls, results } = collectOccurrences(index, evidence, inWindow);
   for (const [id, occurrences] of calls) {
-    if (!occurrences.some((entry) => invocation(entry.block) !== undefined)) continue;
-    const owner = index.toolOwners.get(id);
-    const owned = occurrences.filter((entry) => entry.owner === owner);
-    const uniqueCalls = new Set(occurrences.map((entry) => JSON.stringify([entry.block, entry.row.timestamp])));
-    const paired = (results.get(id) ?? []).filter((entry) => entry.owner === owner);
-    const uniqueResults = new Set(paired.map((entry) => JSON.stringify([entry.block, entry.row.timestamp, entry.row.toolUseResult])));
-    const first = owned[0], response = paired[0];
-    const begin = first && claudeTimestamp(first.row), end = response && claudeTimestamp(response.row);
-    // A replay outside the receiving session's bounds is not a candidate for that session.
-    if (begin !== undefined && !inWindow(begin) || end !== undefined && !inWindow(end)) {
-      if (begin !== undefined && inWindow(begin) || end !== undefined && inWindow(end)) evidence.status = 'partial';
-      continue;
+    try {
+      const event = creationCandidate(id, occurrences, results, calls, index, inWindow);
+      if (event === 'partial') { evidence.status = 'partial'; continue; }
+      if (!event) continue;
+      const key = JSON.stringify([event.toolUseId, event.owner === 'root' ? 'root' : event.ownerId,
+        event.provider, event.host, event.repository, event.number]);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      if (evidence.events.length === MAX_EVENTS) { evidence.status = 'partial'; continue; }
+      evidence.events.push(event);
+    } catch {
+      // An invalid/deep candidate must not discard independently verified events.
+      evidence.status = 'partial';
     }
-    const call = first && invocation(first.block);
-    if (!call || !identity(id) || !owner || !identity(owner) || !linkedOwner(owner, index, calls, inWindow) || index.conflictingTools.has(id)
-      || uniqueCalls.size !== 1 || uniqueResults.size !== 1 || begin === undefined || end === undefined || end < begin) {
-      evidence.status = 'partial'; continue;
-    }
-    const result = verifiedResult(call, response);
-    if (!result) { evidence.status = 'partial'; continue; }
-    if (evidence.events.length === MAX_EVENTS) { evidence.status = 'partial'; continue; }
-    evidence.events.push({ type: call.provider === 'github' ? 'pr_created' : 'mr_created', provider: call.provider, ...result,
-      timestamp: new Date(end).toISOString(), source: call.source, toolUseId: id,
-      owner: owner === index.rootOwnerId ? 'root' : 'subagent', ...(owner !== index.rootOwnerId ? { ownerId: owner } : {}) });
   }
   evidence.events.sort((left, right) => left.timestamp.localeCompare(right.timestamp));
   return evidence;
