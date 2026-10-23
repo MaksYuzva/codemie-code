@@ -43,7 +43,8 @@ function cliOptions(args: string[], provider: Provider): string[] | undefined {
     if (values.has(flag)) { if (!arg.includes('=') && args[++i] === undefined) return; continue; }
     if (/^(?:--(?:help|web|dry-run|recover)|-h|-w)(?:=|$)/.test(arg)) return;
     options.push(arg);
-    if (['--repo', '-R', '--host', '--hostname'].includes(arg)) {
+    if (/^--(?:host|hostname)(?:=|$)/.test(arg)) return;
+    if (['--repo', '-R'].includes(arg)) {
       if (args[i + 1] === undefined) return;
       options.push(args[++i]);
     }
@@ -104,8 +105,6 @@ function cliMatches(call: Invocation, result: NonNullable<ReturnType<typeof pars
     if (arg === '-R' || arg === '--repo') { if (!targetMatches(args[++i], result, call.provider)) return false; }
     else if (arg.startsWith('--repo=')) { if (!targetMatches(arg.slice(7), result, call.provider)) return false; }
     else if (arg.startsWith('-R') && arg.length > 2) { if (!targetMatches(arg.slice(2), result, call.provider)) return false; }
-    else if (arg === '--hostname' || arg === '--host') { if (args[++i]?.toLowerCase() !== result.host) return false; }
-    else if (/^--(?:hostname|host)=/.test(arg) && arg.split('=')[1]?.toLowerCase() !== result.host) return false;
   }
   return true;
 }
@@ -131,7 +130,8 @@ function cliResult(call: Invocation, content: unknown): ReturnType<typeof parseU
   if (typeof content !== 'string' || !content) return;
   const lines = content.trim().split(/\r?\n/).map((line) => line.trim());
   const urls = lines.filter((line) => /^https:\/\/\S+$/.test(line));
-  const prose = lines.filter((line) => !/^https:\/\/\S+$/.test(line)).join('\n');
+  const prose = lines.filter((line) => !/^https:\/\/\S+$/.test(line))
+    .filter((line) => !(call.provider === 'gitlab' && /^Creating (?:draft )?merge request for \S+ into \S+ in \S+$/.test(line))).join('\n');
   if (urls.length !== 1 || /\b(?:error|failed|failure|already|exists|preview)\b/i.test(prose)) return;
   const result = parseUrl(urls[0], call.provider);
   return result && cliMatches(call, result) ? result : undefined;
@@ -150,8 +150,8 @@ function collectRepresentations(value: unknown, records: RecordValue[]): boolean
 function mcpTargetMatches(call: Invocation, payload: RecordValue, result: NonNullable<ReturnType<typeof parseUrl>>): boolean {
   if (call.provider === 'github') {
     return payload.number === result.number
-      && (call.input.owner === undefined || call.input.owner === result.repository.split('/')[0])
-      && (call.input.repo === undefined || call.input.repo === result.repository.split('/')[1]);
+      && (call.input.owner === undefined || typeof call.input.owner === 'string' && call.input.owner.toLowerCase() === result.repository.split('/')[0].toLowerCase())
+      && (call.input.repo === undefined || typeof call.input.repo === 'string' && call.input.repo.toLowerCase() === result.repository.split('/')[1].toLowerCase());
   }
   if (payload.iid !== result.number || !positive(payload.project_id)) return false;
   const project = call.input.project_id;
@@ -196,22 +196,31 @@ type TraceIndex = ReturnType<typeof buildClaudeTraceIndex>;
 type Occurrences = Map<string, Occurrence[]>;
 interface EvidenceWindow { start?: number; end?: number; observedEnd?: number }
 
+function collectRow(row: ClaudeNativeRow, owner: string, calls: Occurrences, results: Occurrences): boolean {
+  let partial = false;
+  for (const block of claudeBlocks(row ?? {})) {
+    const id = block.type === 'tool_use' ? block.id : block.type === 'tool_result' ? block.tool_use_id : undefined;
+    if (!id) {
+      partial ||= block.type === 'tool_use' && invocation(block) !== undefined;
+      continue;
+    }
+    const map = block.type === 'tool_use' ? calls : results;
+    const values = map.get(id) ?? [];
+    values.push({ row, block, owner }); map.set(id, values);
+  }
+  return partial;
+}
+
 function collectOccurrences(index: TraceIndex, evidence: ChangeRequestCreationEvidence): { calls: Occurrences; results: Occurrences } {
   const calls: Occurrences = new Map(), results: Occurrences = new Map();
+  let partial = false;
   for (const owner of index.owners.values()) {
     for (const row of owner.messages as ClaudeNativeRow[]) {
-      for (const block of claudeBlocks(row ?? {})) {
-        const id = block.type === 'tool_use' ? block.id : block.type === 'tool_result' ? block.tool_use_id : undefined;
-        if (!id) {
-          if (block.type === 'tool_use' && invocation(block) !== undefined) evidence.status = 'partial';
-          continue;
-        }
-        const map = block.type === 'tool_use' ? calls : results;
-        const values = map.get(id) ?? [];
-        values.push({ row, block, owner: owner.id }); map.set(id, values);
-      }
+      const rowPartial = collectRow(row, owner.id, calls, results);
+      partial ||= rowPartial;
     }
   }
+  if (partial) evidence.status = 'partial';
   return { calls, results };
 }
 
@@ -248,7 +257,10 @@ export function extractChangeRequestCreationEvidence(parsed: ParsedSession, wind
     const first = owned[0], response = paired[0];
     const begin = first && claudeTimestamp(first.row), end = response && claudeTimestamp(response.row);
     // A replay outside the receiving session's bounds is not a candidate for that session.
-    if (begin !== undefined && !inWindow(begin) || end !== undefined && !inWindow(end)) continue;
+    if (begin !== undefined && !inWindow(begin) || end !== undefined && !inWindow(end)) {
+      if (begin !== undefined && inWindow(begin) || end !== undefined && inWindow(end)) evidence.status = 'partial';
+      continue;
+    }
     const call = first && invocation(first.block);
     if (!call || !identity(id) || !owner || !identity(owner) || !linkedOwner(owner, index, calls, inWindow) || index.conflictingTools.has(id)
       || uniqueCalls.size !== 1 || uniqueResults.size !== 1 || begin === undefined || end === undefined || end < begin) {

@@ -136,6 +136,11 @@ export interface ChangeRequestCreationEvent {
   ownerId?: string;
 }
 
+/**
+ * Coverage of supported creation evidence: available means inspected within the session window;
+ * partial means incomplete or ambiguous evidence; unavailable means no native log;
+ * unsupported means this agent or source has no extractor. Empty events do not prove no work occurred.
+ */
 export interface ChangeRequestCreationEvidence {
   status: 'available' | 'partial' | 'unavailable' | 'unsupported';
   events: ChangeRequestCreationEvent[];

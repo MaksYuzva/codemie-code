@@ -144,4 +144,35 @@ describe('change request creation evidence', () => {
     expect(extract(session([malformed, ...pair()]))).toEqual({ status: 'partial', events: [gh] });
   });
 
+  it.each(['error', 'failed', 'failure', 'already', 'exists', 'preview'])('accepts glab progress with %s in the branch', (word) => {
+    const url = 'https://gitlab.com/team/repo/-/merge_requests/36';
+    expect(extract(session(pair('Bash', { command: 'glab mr create' }, `Creating merge request for fix-${word}-handling into main in team/repo\n${url}`))).events).toHaveLength(1);
+  });
+  it('matches GitHub MCP repository identities without case sensitivity', () => {
+    expect(extract(session(pair('mcp__github__create_pull_request', { owner: 'Acme', repo: 'Repo' }, { number: 36, html_url: gh.url }))).events).toHaveLength(1);
+  });
+  it.each(['gh', 'glab'])('validates attached repository selectors for %s', (cli) => {
+    const url = cli === 'gh' ? gh.url : 'https://gitlab.com/acme/repo/-/merge_requests/36';
+    for (const flag of ['--repo=', '-R']) {
+      for (const repo of ['acme/repo', 'wrong/repo']) {
+        expect(extract(session(pair('Bash', { command: `${cli} ${cli === 'gh' ? 'pr' : 'mr'} create ${flag}${repo}` }, url))).events).toHaveLength(repo === 'acme/repo' ? 1 : 0);
+      }
+    }
+  });
+  it('marks boundary-straddling pairs partial but ignores wholly outside pairs', () => {
+    expect(extract(session(pair()), { observedEnd: Date.parse(start) + 500 })).toEqual({ status: 'partial', events: [] });
+    expect(extract(session(pair()), { end: Date.parse(end) })).toEqual({ status: 'partial', events: [] });
+    expect(extract(session(pair()), { start: Date.parse(end) })).toEqual({ status: 'partial', events: [] });
+    expect(extract(session(pair()), { end: Date.parse(start) })).toEqual({ status: 'available', events: [] });
+    expect(extract(session(pair()), { start: Date.parse(end) + 1 })).toEqual({ status: 'available', events: [] });
+  });
+  it('still rejects an existing PR URL and errors after a progress line', () => {
+    expect(extract(session(pair('Bash', { command: 'gh pr create' }, `a pull request already exists:\n${gh.url}`))).events).toHaveLength(0);
+    expect(extract(session(pair('Bash', { command: 'glab mr create' }, 'Creating merge request for fix-error into main in team/repo\nerror: creation failed\nhttps://gitlab.com/team/repo/-/merge_requests/36'))).events).toHaveLength(0);
+  });
+
+  it.each(['--host gitlab.com', '--hostname=gitlab.com'])('rejects unsupported host flag %s', (flag) => {
+    expect(extract(session(pair('Bash', { command: `glab mr create ${flag}` }, 'https://gitlab.com/team/repo/-/merge_requests/36')))).toEqual({ status: 'partial', events: [] });
+  });
+
 });

@@ -1,4 +1,3 @@
-import { extractChangeRequestCreationEvidence } from './change-request-creation-extractor.js';
 /**
  * Report-time cost enrichment.
  *
@@ -10,9 +9,10 @@ import { extractChangeRequestCreationEvidence } from './change-request-creation-
  */
 
 import { readFile } from 'node:fs/promises';
+import { extractChangeRequestCreationEvidence } from './change-request-creation-extractor.js';
 import { INTERNAL_PARSED_FAMILY, type RawSessionData } from '../data-loader.js';
 import type { ParsedSession, SessionAdapter } from '@/agents/core/session/BaseSessionAdapter.js';
-import type { SessionCost, SessionCostIndex, CostSummary, ModelCost, TokenUsage, CostSeriesPoint, ModelTimelinePoint } from './types.js';
+import type { ChangeRequestCreationEvidence, SessionCost, SessionCostIndex, CostSummary, ModelCost, TokenUsage, CostSeriesPoint, ModelTimelinePoint } from './types.js';
 import type { DispatchEventRaw } from './types.js';
 import { MAX_SERIES_POINTS } from './types.js';
 import { emptyUsage, addUsage, costBreakdown, costForUsage } from './cost-calculator.js';
@@ -251,6 +251,31 @@ function floorObservedEnd(entry: ParsedEntry, nextSiblingStart: number | undefin
   }
   const floor = entry.parsed ? maxOwnRecordTs(entry.agentName, entry.parsed, nextSiblingStart) : undefined;
   return floor === undefined ? entry.observedEnd : Math.max(entry.observedEnd, floor);
+}
+
+/** Resolve creation independently of pricing, retaining only events owned by this session. */
+function resolveCreationEvidence(entry: ParsedEntry, siblingStart: number | undefined, seen: Set<string>): ChangeRequestCreationEvidence {
+  if (!['claude', 'claude-acp', 'claude-desktop'].includes(entry.agentName.toLowerCase())) return { status: 'unsupported', events: [] };
+  if (!entry.parsed) return { status: entry.hadLog ? 'partial' : 'unavailable', events: [] };
+  try {
+    const evidence = extractChangeRequestCreationEvidence(entry.parsed, {
+      start: entry.observedStart ?? (entry.startTime > 0 ? entry.startTime : undefined),
+      end: siblingStart,
+      // Correct the Stop-hook write race using owned usage, never a cosmetic end estimate.
+      observedEnd: floorObservedEnd(entry, siblingStart),
+    });
+    evidence.events = evidence.events.filter((event) => {
+      const key = JSON.stringify([event.toolUseId, event.owner === 'root' ? 'root' : event.ownerId,
+        event.provider, event.host, event.repository, event.number]);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+    return evidence;
+  } catch {
+    // Coverage communicates failure without leaking native commands/results to diagnostics.
+    return { status: 'partial', events: [] };
+  }
 }
 
 /** Phase 1: resolve + parse a session's native log. Safe to run in parallel. */
@@ -620,31 +645,7 @@ export async function enrichCosts(
       records = [];
     }
     const { cost, unpriced: u, estimated: est, local: loc } = priceUsage(entry.sessionId, entry.hadLog, usageByModel, entry.provider);
-    // Creation evidence is independent of usage/pricing and never uses cosmetic end estimates.
-    cost.changeRequestCreation = { status: 'unsupported', events: [] };
-    if (['claude', 'claude-acp', 'claude-desktop'].includes(entry.agentName.toLowerCase())) {
-      cost.changeRequestCreation = { status: entry.hadLog ? 'partial' : 'unavailable', events: [] };
-      if (entry.parsed) {
-        try {
-          const evidence = extractChangeRequestCreationEvidence(entry.parsed, {
-            start: entry.observedStart ?? (entry.startTime > 0 ? entry.startTime : undefined),
-            end: nextSiblingStart.get(entry.sessionId),
-            observedEnd: entry.observedEnd,
-          });
-          evidence.events = evidence.events.filter((event) => {
-            const key = JSON.stringify([event.toolUseId, event.owner === 'root' ? 'root' : event.ownerId,
-              event.provider, event.host, event.repository, event.number]);
-            if (seenCreations.has(key)) return false;
-            seenCreations.add(key);
-            return true;
-          });
-          cost.changeRequestCreation = evidence;
-        } catch {
-          // Coverage communicates failure without leaking native commands/results to diagnostics.
-          cost.changeRequestCreation = { status: 'partial', events: [] };
-        }
-      }
-    }
+    cost.changeRequestCreation = resolveCreationEvidence(entry, nextSiblingStart.get(entry.sessionId), seenCreations);
     if (entry.capturedAt !== undefined) cost.capturedAt = entry.capturedAt;
     if (entry.observedStart !== undefined) cost.observedStart = entry.observedStart;
     if (entry.observedEnd !== undefined) cost.observedEnd = entry.observedEnd;
